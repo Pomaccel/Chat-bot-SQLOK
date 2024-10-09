@@ -1,151 +1,229 @@
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+import google.generativeai as genai
+from google.cloud import bigquery
+import json
+import db_dtypes
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+
+# Main application title
+st.title("Chatbot ABC")
+
+# Initialize session state variables if not already present
+if "gemini_api_key" not in st.session_state:
+    st.session_state.gemini_api_key = None
+
+if "google_service_account_json" not in st.session_state:
+    st.session_state.google_service_account_json = None
+
+# Input for Google Service Account Key File using file uploader
+uploaded_file = st.file_uploader("Upload Google Service Account Key JSON", type="json")
+
+if uploaded_file:
+    try:
+        # Load the uploaded JSON file into session state
+        st.session_state.google_service_account_json = json.load(uploaded_file)
+        st.success("Google Service Account Key file uploaded successfully!")
+    except Exception as e:
+        st.error(f"Error reading the uploaded file: {e}")
+
+if "google_api_key" not in st.session_state:
+    st.session_state.google_api_key = None
+
+if "greeted" not in st.session_state:
+    st.session_state.greeted = False
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "user_input_history" not in st.session_state:
+    st.session_state.user_input_history = []
+
+if "rerun_needed" not in st.session_state:
+    st.session_state.rerun_needed = False  # Flag to control reruns
+
+if "qry" not in st.session_state:
+    st.session_state.qry = None  # Store SQL query here
+
+# Sidebar to display user input history as buttons
+st.sidebar.title("User Input History")
+
+# Add a dropdown for selecting options
+dropdown_option = st.sidebar.selectbox(
+    "Select an option:",
+    ["0.Overview", "1.Predict", "2.Sale By location"]
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Add "Clear History" button in the sidebar
+if st.sidebar.button("Clear History"):
+    st.session_state.chat_history = []
+    st.session_state.user_input_history = []
+    st.session_state.greeted = False
+    st.session_state.rerun_needed = True  # Set flag to trigger a rerun
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Loop through the user input history and create a button for each one
+for i, prompt in enumerate(st.session_state.user_input_history, start=1):
+    if st.sidebar.button(f"{i}. {prompt}"):
+        st.session_state.chat_history = [("user", prompt)]  # Start fresh with that prompt        
+        st.session_state.rerun_needed = True  # Set flag to trigger a rerun
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+        user_input = prompt
+        try:
+            query_prompt = f"""You are an AI assistant that transforms user questions into SQL queries to retrieve data from a BigQuery database. 
+            Use the schema information and generate a SQL query based on the user's input: '{user_input}'."""
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+            response = model.generate_content(query_prompt)
+            bot_response = response.text
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+            st.session_state.qry = bot_response
+            st.session_state.chat_history.append(("assistant", bot_response))
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+        except Exception as e:
+            st.error(f"Error generating AI response: {e}")
+        break  # Exit the loop after processing the first clicked history button
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+# Input for Gemini API Key
+gemini_api_key = st.text_input("Gemini API Key: ", placeholder="Type your API Key here...", type="password")
 
-    return gdp_df
+# Function to initialize BigQuery client
+def init_bigquery_client():
+    if st.session_state.google_service_account_json:
+        try:
+            # Initialize BigQuery client using the service account JSON
+            client = bigquery.Client.from_service_account_info(st.session_state.google_service_account_json)
+            return client
+        except Exception as e:
+            st.error(f"Error initializing BigQuery client: {e}")
+            return None
+    else:
+        st.error("Please upload a valid Google Service Account Key file.")
+        return None
 
-gdp_df = get_gdp_data()
+def preprocess_query(query):
+    # Ensure the query is a string
+    if isinstance(query, str):
+        # Remove any leading or trailing whitespace
+        query = query.strip()
+        
+        # Remove Markdown code block syntax if present
+        if query.startswith('```'):
+            query = query.split('\n', 1)[-1]  # Remove the first line if it starts with ```
+            query = query.rsplit('\n', 1)[0]  # Remove the last line if it's just ```
+    return query  # Now returning a string, not a tuple
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
+def run_bigquery_query(query):
+    client = init_bigquery_client()
+    if client and query:
+        try:
+            query = preprocess_query(query)
+            #st.write("Executing query:", query)  # Log the query being executed
+            
+            job_config = bigquery.QueryJobConfig()
+            query_job = client.query(query, job_config=job_config)
+            results = query_job.result()
+            
+            # Convert to a pandas DataFrame
+            df = results.to_dataframe()
+            st.write("Query Results:")
+            st.dataframe(df)  # Display results in a nice format
+        except ValueError as ve:
+            st.error(f"Invalid SQL query: {ve}")
+        except Exception as e:
+            st.error(f"Error executing BigQuery SQL: {e}")
+    else:
+        st.error("BigQuery client not initialized or no query to run.")
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+# Configure Gemini API
+if gemini_api_key:
+    try:
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel("gemini-pro")
+    except Exception as e:
+        st.error(f"Error configuring Gemini API: {e}")
+        model = None  # Ensure 'model' is None if initialization fails
 
-st.header(f'GDP in {to_year}', divider='gray')
+    # Display chat history
+    for role, message in st.session_state.chat_history:
+        st.chat_message(role).markdown(message)
 
-''
+    # Generate greeting if not already greeted
+    if not st.session_state.greeted:
+        greeting_prompt = "Greet the user as a friendly and knowledgeable data engineer. \
+                        Introduce yourself (you are AI assistant) and let the user know you're here to assist with \
+                        any questions they may have about transforming user questions into SQL queries to retrieve data from a BigQuery database."
 
-cols = st.columns(4)
+        try:
+            response = model.generate_content(greeting_prompt)
+            bot_response = response.text.strip()
+            st.session_state.chat_history.append(("assistant", bot_response))
+            st.chat_message("assistant").markdown(bot_response)
+            st.session_state.greeted = True
+        except Exception as e:
+            st.error(f"Error generating AI greeting: {e}")
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+    # Input box for user's message
+    if user_input := st.chat_input("Type your message here..."):
+        st.session_state.chat_history.append(("user", user_input))
+        st.session_state.user_input_history.append(user_input)
+        st.chat_message("user").markdown(user_input)
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
+        try:
+            prompt = """You are an AI assistant that transforms user questions into SQL queries to retrieve data from a BigQuery database. 
+                    Below is the detailed schema of the database, including table names, column names, data types, and descriptions. 
+                    Use this information to generate accurate SQL queries based on user input. 
+                    ### Data Dictionary 
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+                    Table 'madt-finalproject.finalproject_data.inv_transaction'
+                    | Column Name                       | Data Type   | Description                                 | 
+                    |-----------------------------------|-------------|---------------------------------------------| 
+                    | ProductId                         | STRING      | ProductId                                   | 
+                    | StoreId                           | STRING      | StoreId                                     | 
+                    | TypeId                            | STRING      | Invoice type ID.                            |
+                    | InvoiceNo                         | STRING      | Invoice number.                             | 
+                    | Reorder_Cause_ID                  | STRING      | Reorder id.                                 | 
+                    | Quantity                          | INT64       | Quantity of products in each invoices.      | 
+                    | CustomerID                        | STRING      | Customer ID.                                | 
+                    | Customer                          | STRING      | Customer name.                              | 
+                    | Country                           | STRING      | Customer country.                           | 
+                    | OpticMainID                       | STRING      | Optical ID for each customer.               | 
+                    | Category                          | STRING      | Customer category.                          | 
+                    | zoneId                            | STRING      | Zone ID.                                    |
+                    | InvoiceDate                       | DATE        | Invoice Date.                               |
+                    | InvoiceYear                       | INT64       | Invoice Year.                               |
+                    | InvoiceMonth                      | INT64       | Invoice Month.                              |
+                    | InvoiceDay                        | INT64       | Invoice day.                                |
+                    | InvoiceWeek                       | INT64       | Invoice week.                               |
+                    | InvoiceQuarter                    | INT64       | Invoice quarter.                            |
+                    | type_name                         | STRING      | Type of invoice including Credit Note, Debit Note, Invoice Sales, Other charge  | 
+                    | lenstype                          | STRING      | lenstype                                    | 
+                    | Part_Description                  | STRING      | Product description                         | 
+                    | Material_Type                     | STRING      | Type of material.                           | 
+                    | Lens_Type                         | STRING      | Type of lens.                               | 
+                    | price                             | FLOAT64     | Price of each products.                     | 
+                    | cause                             | STRING      | cause of reorder.                           |  
+                    | Store                             | STRING      | Store name.                                 | 
+                    | Zoning_ProvinceEN                 | STRING      | Province(English)                           | 
+                    | Zoning_ProvinceTH                 | STRING      | Province(Thai)                              | 
+                    | Zoning_Region                     | STRING      | Region                                      | 
+                    """
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+            # Add chat history to the prompt
+            full_prompt = f"{prompt}\nUser Input: {user_input}\n"
+            response = model.generate_content(full_prompt)
+            bot_response = response.text
+            
+            st.session_state.qry = bot_response
+            st.session_state.chat_history.append(("assistant", bot_response))
+            st.chat_message("assistant").markdown(bot_response)
+
+        except Exception as e:
+            st.error(f"Error generating AI response: {e}")
+
+    # Run the BigQuery query if it exists
+    if st.session_state.qry:
+        run_bigquery_query(st.session_state.qry)
+
+# Check if a rerun is needed
+if st.session_state.rerun_needed:
+    st.experimental_rerun()  # Rerun the app to refresh state
+
